@@ -1,0 +1,171 @@
+name: Build Kaira APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Apply Kaira changes (name, logo, privacy)
+        run: |
+          pip install pillow
+          test -f Screenshot/kaira-icon.jpg || { echo "Screenshot/kaira-icon.jpg nahi mili"; exit 1; }
+          python3 - <<'PY'
+          import glob, os, re, sys
+          from PIL import Image, ImageDraw, ImageStat
+
+          ICON = sys.argv[1] if len(sys.argv) > 1 else "Screenshot/kaira-icon.jpg"
+          RES = "app/src/main/res"
+          JAVA = "app/src/main/java"
+
+
+          def read(p):
+              with open(p, encoding="utf-8") as f:
+                  return f.read()
+
+
+          def write(p, s):
+              with open(p, "w", encoding="utf-8", newline="") as f:
+                  f.write(s)
+
+
+          def sub(path, old, new):
+              s = read(path)
+              if old not in s:
+                  sys.exit("PATTERN NOT FOUND in %s: %s" % (path, old[:70]))
+              write(path, s.replace(old, new, 1))
+
+
+          # 1) application id, backup off
+          sub("app/build.gradle.kts", 'applicationId = "com.lastwave.app"', 'applicationId = "com.kaira.music"')
+          sub("app/src/main/AndroidManifest.xml", 'android:allowBackup="true"', 'android:allowBackup="false"')
+
+          # 2) app name in every language
+          for f in glob.glob(RES + "/values*/strings.xml"):
+              s = read(f)
+              write(f, re.sub(r'<string name="app_name">[^<]*</string>', '<string name="app_name">Kaira</string>', s))
+          en = RES + "/values/strings.xml"
+          write(en, read(en).replace("LastWave", "Kaira"))
+          write(en, re.sub(r'<string name="about_made_by">[^<]*</string>',
+                           '<string name="about_made_by">Personal fork of LastWave (GPL-3.0)</string>', read(en)))
+
+          # 3) visible hardcoded labels
+          for f in glob.glob(JAVA + "/**/*.kt", recursive=True):
+              s = read(f)
+              if '"LastWave"' in s:
+                  write(f, s.replace('"LastWave"', '"Kaira"'))
+
+          # 4) privacy: block screenshots / recents preview
+          sub(JAVA + "/com/lastwave/app/MainActivity.kt",
+              "        super.onCreate(savedInstanceState)\n        volumeControlStream = android.media.AudioManager.STREAM_MUSIC",
+              "        super.onCreate(savedInstanceState)\n"
+              "        window.setFlags(\n"
+              "            android.view.WindowManager.LayoutParams.FLAG_SECURE,\n"
+              "            android.view.WindowManager.LayoutParams.FLAG_SECURE\n"
+              "        )\n"
+              "        volumeControlStream = android.media.AudioManager.STREAM_MUSIC")
+
+          # 5) privacy: never contact the original author's GitHub for updates
+          um = JAVA + "/com/lastwave/app/data/update/AppUpdateManager.kt"
+          sub(um, "    fun checkForUpdate(isSilent: Boolean = false) {\n        scope.launch {",
+              "    fun checkForUpdate(isSilent: Boolean = false) {\n"
+              "        if (KAIRA_UPDATES_DISABLED) {\n"
+              "            _updateInfo.update { it.copy(isChecking = false, message = null) }\n"
+              "            return\n"
+              "        }\n"
+              "        scope.launch {")
+          sub(um, "@Singleton\nclass AppUpdateManager @Inject constructor(",
+              "private const val KAIRA_UPDATES_DISABLED = true\n\n@Singleton\nclass AppUpdateManager @Inject constructor(")
+
+          # 6) icons from the supplied picture
+          im = Image.open(ICON).convert("RGB")
+          w, h = im.size
+          s = min(w, h)
+          im = im.crop(((w - s) // 2, (h - s) // 2, (w - s) // 2 + s, (h - s) // 2 + s))
+          ring = Image.new("L", im.size, 0)
+          d = ImageDraw.Draw(ring)
+          d.rectangle([0, 0, s, s], fill=255)
+          d.rectangle([s * 0.08, s * 0.08, s * 0.92, s * 0.92], fill=0)
+          mean = ImageStat.Stat(im, ring).mean
+          bg = tuple(int(c * 0.8) for c in mean)
+          hexbg = "#FF%02X%02X%02X" % bg
+
+          fg = Image.new("RGBA", (432, 432), bg + (255,))
+          fg.paste(im.resize((288, 288), Image.LANCZOS), (72, 72))
+          os.makedirs(RES + "/drawable-nodpi", exist_ok=True)
+          fg.save(RES + "/drawable-nodpi/ic_launcher_foreground.png")
+          if os.path.exists(RES + "/drawable/ic_launcher_foreground.xml"):
+              os.remove(RES + "/drawable/ic_launcher_foreground.xml")
+
+          sizes = {"mdpi": 48, "hdpi": 72, "xhdpi": 96, "xxhdpi": 144, "xxxhdpi": 192}
+          names = ["ic_launcher", "ic_launcher_black", "ic_launcher_white", "ic_launcher_desktop"]
+          for dens, px in sizes.items():
+              base = im.resize((px, px), Image.LANCZOS).convert("RGBA")
+              m1 = Image.new("L", (px * 4, px * 4), 0)
+              ImageDraw.Draw(m1).rounded_rectangle([0, 0, px * 4 - 1, px * 4 - 1], radius=px * 4 // 6, fill=255)
+              sq = base.copy()
+              sq.putalpha(m1.resize((px, px), Image.LANCZOS))
+              m2 = Image.new("L", (px * 4, px * 4), 0)
+              ImageDraw.Draw(m2).ellipse([0, 0, px * 4 - 1, px * 4 - 1], fill=255)
+              rd = base.copy()
+              rd.putalpha(m2.resize((px, px), Image.LANCZOS))
+              for n in names:
+                  sq.save("%s/mipmap-%s/%s.png" % (RES, dens, n))
+                  rd.save("%s/mipmap-%s/%s.png" % (RES, dens, n.replace("ic_launcher", "ic_launcher_round", 1)))
+
+          adaptive = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                      '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                      '    <background android:drawable="@color/ic_launcher_background" />\n'
+                      '    <foreground android:drawable="@drawable/ic_launcher_foreground" />\n'
+                      '</adaptive-icon>\n')
+          for f in glob.glob(RES + "/mipmap-anydpi-v26/ic_launcher*.xml"):
+              write(f, adaptive)
+          sub(RES + "/values/colors.xml", '<color name="ic_launcher_background">#FFC9FB00</color>',
+              '<color name="ic_launcher_background">%s</color>' % hexbg)
+
+
+          def wave(color):
+              return ('<vector xmlns:android="http://schemas.android.com/apk/res/android"\n'
+                      '    android:width="108dp"\n    android:height="108dp"\n'
+                      '    android:viewportWidth="108"\n    android:viewportHeight="108">\n'
+                      '    <path\n        android:pathData="M20,54 C28,26 40,26 54,54 C68,82 80,82 88,54"\n'
+                      '        android:strokeWidth="10"\n        android:strokeLineCap="round"\n'
+                      '        android:strokeColor="%s" />\n</vector>\n' % color)
+
+
+          write(RES + "/drawable/ic_launcher_logo.xml", wave("#FFFFFFFF"))
+          write(RES + "/drawable/ic_launcher_logo_desktop.xml", wave("#FFFFFFFF"))
+          write(RES + "/drawable/ic_launcher_logo_black.xml", wave("#FFFFFFFF"))
+          write(RES + "/drawable/ic_launcher_logo_white.xml", wave("#FF000000"))
+
+          print("Kaira patch applied. background colour", hexbg)
+          PY
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          find app/build/outputs/apk -name "*.apk" -exec cp {} out/ \;
+          ls -lh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kaira-APK
+          path: out/*.apk
